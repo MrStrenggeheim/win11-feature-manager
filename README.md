@@ -2,6 +2,9 @@
 
 A PowerShell script to manage Windows 11 AI features, background services, and resource-heavy processes. All changes are fully reversible with built-in backup and restore functionality.
 
+![Windows 11 Feature Manager Showcase](showcase.png)
+
+
 ## Features
 
 - **20+ Configurable Features** across 9 categories:
