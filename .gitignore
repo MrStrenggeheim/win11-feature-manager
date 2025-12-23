@@ -1,0 +1,23 @@
+# Logs
+Logs/
+*.log
+
+# Backups (user-specific data)
+Backups/
+
+# Windows/System files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# VS Code
+.vscode/
+
+# PowerShell
+*.ps1xml
+
+# Temporary files
+*.tmp
+*.temp
+~$*
