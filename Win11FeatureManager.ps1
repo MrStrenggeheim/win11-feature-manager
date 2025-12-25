@@ -617,8 +617,131 @@ function Write-Log {
 }
 
 # ============================================
+# REGISTRY ELEVATION HELPER
+# ============================================
+
+function Set-RegistryValueWithElevation {
+    param(
+        [string]$Path,
+        [string]$Name,
+        $Value,
+        [string]$ValueType
+    )
+    
+    # Ensure the path exists first
+    if (-not (Test-Path $Path)) {
+        try {
+            New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
+        } catch [System.UnauthorizedAccessException] {
+            Write-Log "  Access denied creating path, attempting ownership takeover..." -Level WARNING
+            # Need to take ownership of parent path
+            $parentPath = Split-Path $Path -Parent
+            if (-not (Grant-RegistryAccess -Path $parentPath)) {
+                return $false
+            }
+            New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
+        }
+    }
+    
+    # Try normal approach first
+    try {
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $ValueType -ErrorAction Stop
+        return $true
+    } catch [System.UnauthorizedAccessException] {
+        Write-Log "  Access denied, attempting ownership takeover..." -Level WARNING
+    } catch {
+        throw
+    }
+    
+    # Take ownership and grant access
+    if (-not (Grant-RegistryAccess -Path $Path)) {
+        return $false
+    }
+    
+    # Retry the operation
+    try {
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $ValueType -ErrorAction Stop
+        Write-Log "  Successfully set after taking ownership" -Level SUCCESS
+        return $true
+    } catch {
+        Write-Log "  Failed even after ownership attempt: $($_.Exception.Message)" -Level ERROR
+        return $false
+    }
+}
+
+function Grant-RegistryAccess {
+    param(
+        [string]$Path
+    )
+    
+    try {
+        # Convert PowerShell path to .NET format
+        $hive = $Path.Split(':')[0]
+        $subKey = $Path.Split(':')[1].TrimStart('\')
+        
+        $regHive = switch ($hive) {
+            "HKLM" { [Microsoft.Win32.RegistryHive]::LocalMachine }
+            "HKCU" { [Microsoft.Win32.RegistryHive]::CurrentUser }
+            "HKCR" { [Microsoft.Win32.RegistryHive]::ClassesRoot }
+            default { 
+                Write-Log "  Unsupported registry hive: $hive" -Level ERROR
+                return $false 
+            }
+        }
+        
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($regHive, [Microsoft.Win32.RegistryView]::Default)
+        
+        # Step 1: Take ownership
+        $key = $baseKey.OpenSubKey($subKey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, 
+            [System.Security.AccessControl.RegistryRights]::TakeOwnership)
+        
+        if ($null -eq $key) {
+            Write-Log "  Could not open key for ownership: $Path" -Level ERROR
+            $baseKey.Close()
+            return $false
+        }
+        
+        $acl = $key.GetAccessControl()
+        $admin = [System.Security.Principal.NTAccount]"BUILTIN\Administrators"
+        $acl.SetOwner($admin)
+        $key.SetAccessControl($acl)
+        $key.Close()
+        
+        # Step 2: Grant full control
+        $key = $baseKey.OpenSubKey($subKey, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+            [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+        
+        if ($null -eq $key) {
+            Write-Log "  Could not open key for permissions: $Path" -Level ERROR
+            $baseKey.Close()
+            return $false
+        }
+        
+        $acl = $key.GetAccessControl()
+        $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
+            $admin,
+            [System.Security.AccessControl.RegistryRights]::FullControl,
+            [System.Security.AccessControl.InheritanceFlags]::ContainerInherit,
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $acl.AddAccessRule($rule)
+        $key.SetAccessControl($acl)
+        $key.Close()
+        $baseKey.Close()
+        
+        Write-Log "  Granted access to: $Path" -Level INFO
+        return $true
+    } catch {
+        Write-Log "  Failed to grant access: $($_.Exception.Message)" -Level ERROR
+        return $false
+    }
+}
+
+# ============================================
 # BACKUP AND RESTORE FUNCTIONS
 # ============================================
+
 
 function Initialize-BackupFolder {
     if (-not (Test-Path $Script:BackupFolder)) {
@@ -660,6 +783,7 @@ function Get-CurrentSettings {
                             $settingData.Exists = $false
                         }
                     } catch {
+                        Write-Log "Failed to read registry $($setting.Path)\$($setting.Name): $($_.Exception.Message)" -Level WARNING
                         $settingData.Exists = $false
                     }
                 }
@@ -678,6 +802,7 @@ function Get-CurrentSettings {
                             $settingData.Exists = $false
                         }
                     } catch {
+                        Write-Log "Failed to read service $($setting.ServiceName): $($_.Exception.Message)" -Level WARNING
                         $settingData.Exists = $false
                     }
                 }
@@ -763,7 +888,7 @@ function Restore-FromBackup {
                             } catch {
                                 $failCount++
                                 $failedItems += $settingBackup.Name
-                                Write-Log ("  Failed: " + $settingBackup.Name) -Level WARNING
+                                Write-Log ("  Failed: " + $settingBackup.Name + " - " + $_.Exception.Message) -Level WARNING
                             }
                         }
                     }
@@ -776,7 +901,7 @@ function Restore-FromBackup {
                             } catch {
                                 $failCount++
                                 $failedItems += ("Service: " + $settingBackup.ServiceName)
-                                Write-Log ("  Failed service: " + $settingBackup.ServiceName) -Level WARNING
+                                Write-Log ("  Failed service: " + $settingBackup.ServiceName + " - " + $_.Exception.Message) -Level WARNING
                             }
                         }
                     }
@@ -928,11 +1053,12 @@ function Set-Feature {
                             Write-Log ("  Removed: " + $setting.Path + "\" + $setting.Name) -Level INFO
                         }
                     } else {
-                        if (-not (Test-Path $setting.Path)) {
-                            New-Item -Path $setting.Path -Force | Out-Null
+                        $result = Set-RegistryValueWithElevation -Path $setting.Path -Name $setting.Name -Value $targetValue -ValueType $setting.ValueType
+                        if ($result) {
+                            Write-Log ("  Set: " + $setting.Path + "\" + $setting.Name + " = " + $targetValue) -Level INFO
+                        } else {
+                            $success = $false
                         }
-                        Set-ItemProperty -Path $setting.Path -Name $setting.Name -Value $targetValue -Type $setting.ValueType
-                        Write-Log ("  Set: " + $setting.Path + "\" + $setting.Name + " = " + $targetValue) -Level INFO
                     }
                 }
                 "Service" {
@@ -947,7 +1073,7 @@ function Set-Feature {
                         if ($Disable) {
                             Stop-Service -Name $setting.ServiceName -Force -ErrorAction SilentlyContinue
                         }
-                        Set-Service -Name $setting.ServiceName -StartupType $targetStartup
+                        Set-Service -Name $setting.ServiceName -StartupType $targetStartup -ErrorAction Stop
                         Write-Log ("  Service " + $setting.ServiceName + ": " + $targetStartup) -Level INFO
                     } else {
                         Write-Log ("  Service not found: " + $setting.ServiceName) -Level WARNING
@@ -955,7 +1081,7 @@ function Set-Feature {
                 }
             }
         } catch {
-            Write-Log "  Failed to configure: $_" -Level ERROR
+            Write-Log "  Failed to configure $($setting.Type) '$($setting.Name)': $($_.Exception.Message)" -Level ERROR
             $success = $false
         }
     }
