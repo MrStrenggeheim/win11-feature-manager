@@ -28,6 +28,19 @@ A PowerShell script to manage Windows 11 AI features, background services, and r
 - PowerShell 5.1 or later
 - Administrator privileges
 
+You may need to update the execution policy to allow running scripts, as Windows restricts this by default for security purposes.
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine
+```
+
+To verify the change:
+
+```powershell
+Get-ExecutionPolicy -List
+```
+
+
 ## Usage
 
 ### Interactive Mode (Recommended)
